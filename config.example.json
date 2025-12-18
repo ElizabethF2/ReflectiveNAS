@@ -1,0 +1,55 @@
+{
+  "Friendly_Name": "Node Alpha",
+  "HD_Replace_Date": 1893484800,
+  "Passthrough":
+  {
+    "Real_Directory": "/srv/ReflectiveNASBackend",
+    "Proxy_Directory": "/srv/ReflectiveNAS",
+    "History": "/srv/ReflectiveNASBackend/Hidden/History",
+    "Excluded_Paths": ["/$RECYCLE.BIN", "/Hidden"],
+    "Allow_Other": true
+  },
+  "Database":
+  {
+    "Path": "data.db",
+    "Cache_Size": 100
+  },
+  "Logging":
+  {
+    "Path": "debug.log",
+    "Level": "ERROR"
+  },
+  "Local_Server":
+  {
+    "Port": 1234,
+    "Cert_Path": "cert.pem",
+    "Key_Path": "key.pem",
+    "Secret": "DWXSQyaIHFd4LrIhu7KrBa7nKJVE3Iz327lwHkMkWI873GZ5AI",
+    "DNS_Update_URL": "https://www.example.com/update?domains=mysubdomain&token=f53990fb-3d6c-4f7a-bd7c-2277d19db6eb",
+    "URL": "https://mysubdomain.example.com:1234"
+  },
+  "Remote_Servers":
+  [
+    {"URL": "https://mysubdomain2.example.com:1234", "Secret": "n2UUTMQZkKDcvl3GoLgO0Fo78VxOEzDBRorb1HNheBY7rZuvta"},
+    {"URL": "https://mysubdomain3.example.com:1234", "Secret": "w4SU8vrtC1vkwrYdCFIg5gMID76yb3jmSsspuHCy6ufpbjIJfs"}
+  ],
+  "Synchronization":
+  {
+    "Number_of_Files_To_Check": 10,
+    "Probability_of_Checking_Files": 10,
+    "Delay_Between_Syncs": 30,
+    "Retry_Count": 5,
+    "Retry_Delay": 2,
+    "Timeout": 180
+  },
+  "Email":
+  {
+    "Host": "smtp.example.com",
+    "Port": 587,
+    "SSL": false,
+    "TLS": true,
+    "User": "example@example.com",
+    "Password": "ZuxzV1gQhM0M",
+    "Recipients": ["example@example.com"]
+  }
+}

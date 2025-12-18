@@ -1,12 +1,14 @@
-import ReflectiveNAS, os, time, hashlib, logging, shutil, posixpath, code, functools
+#!/usr/bin/env python3
+
+import os, time, hashlib, logging, shutil, posixpath, code, functools
 from datetime import datetime as dt
+
+import ReflectiveNAS
 
 try:
   import readline
 except ModuleNotFoundError:
   pass
-
-TICK = 0.00002
 
 def fmt_time(t):
   return dt.utcfromtimestamp(t).strftime('%Y-%m-%d %H:%M:%S')
@@ -22,12 +24,15 @@ def fmt_size(num, suffix='B'):
 def hash_file_cached(path):
   return ReflectiveNAS.hash_file(path)
 
+def log_and_print(msg, level = logging.INFO):
+  logging.log(level, msg)
+  print(msg)
+
 class Tools(object):
   def __init__(self, core):
     self.core = core
     self.synchronizer = ReflectiveNAS.Synchronizer(self.core,
-                                                   start_worker=False,
-                                                   use_memfs=False)
+                                                   use_memfs = False)
 
   def main_menu(self):
     while True:
@@ -130,6 +135,7 @@ class Tools(object):
             print("\nError: Can't download a folder!")
           else:
             dest = input('Enter destination: ')
+            hash_file_cached.cache_clear()
             local_copy = self.core.get_real_path_by_hash_and_size(file[3], file[4])
             if local_copy:
               print('Copying...')
@@ -146,6 +152,7 @@ class Tools(object):
 
   def _get_file_from_remote_servers_by_hash_and_size(self, hash, size, dest):
     print('Looking for file...')
+    hash_file_cached.cache_clear()
     for server in self.synchronizer.remote_servers:
       try:
         server.get_file(hash, size, dest)
@@ -168,24 +175,40 @@ class Tools(object):
     self._get_file_from_remote_servers_by_hash_and_size(hash, size, dest)
 
   def find_a_conflict(self):
-    _, _, conflict = self.core.db.verify_database(fail_safe_on_conflict=False)
+    kw = {'fail_safe_on_conflict': False}
+    _, _, conflict = self.core.db.verify_database(**kw)
     return conflict
 
-  def resolve_a_conflict(self, conflict):
+  def resolve_a_conflict(self, conflict, dry_run = False):
     if conflict['type'] == 'created_exists':
       ts, _, path, hash, size, mtime = conflict['last']
-      ts += TICK
-      self.core.db.record_change(ReflectiveNAS.Action.DELETE, path,
-                                 hash=hash, size=size, mtime=mtime, timestamp=ts)
+      ts += self.core.config.get('Epsilon', ReflectiveNAS.DEFAULT_EPSILON)
+      action = ReflectiveNAS.Action.DELETE
     elif conflict['type'] == 'modified_missing':
       ts, _, path, hash, size, mtime = conflict['new']
-      ts -= TICK
-      self.core.db.record_change(ReflectiveNAS.Action.CREATE, path,
-                                 hash=hash, size=size, mtime=mtime, timestamp=ts)
+      ts -= self.core.config.get('Epsilon', ReflectiveNAS.DEFAULT_EPSILON)
+      action = ReflectiveNAS.Action.CREATE
     elif conflict['type'] == 'move_no_destination':
       ts, _, path, hash, size, mtime = conflict['new']
-      self.core.db.record_change(ReflectiveNAS.Action.MOVE_DESTINATION, path,
-                                 hash=hash, size=size, mtime=mtime, timestamp=ts)
+      action = ReflectiveNAS.Action.MOVE_DESTINATION
+    if dry_run:
+      print('(Dry Run) Action:', action)
+      print('(Dry Run) Path:', path)
+      print('(Dry Run) Hash:', hash)
+      print('(Dry Run) Size:', size)
+      print('(Dry Run) MTime:', mtime)
+      print('(Dry Run) Timestamp:', ts)
+      print('')
+    else:
+      self.core.db.record_change(
+        action,
+        path,
+        hash = hash,
+        size = size,
+        mtime = mtime,
+        timestamp = ts,
+        use_epsilon = False,
+      )
 
   def resolve_conflicts(self):
     print('This tool will attempt to fix conflicting changes by guessing which change')
@@ -193,7 +216,7 @@ class Tools(object):
     print('After it runs, you will need to manually verify that all of the paths with')
     print('conflicts have been fixed. You may need to run this tool multiple times. A')
     print('copy of what\'s been changed will also be recorded to the log. You can use')
-    print('the other tools to restore files from history if nessicary.')
+    print('the other tools to restore files from history if necessary.')
     print('')
     print('Enter 1 to start or anything else to abort:')
     inp = input('> ')
@@ -201,18 +224,20 @@ class Tools(object):
       return
     print('')
     conflicts_found = False
-    type2change = {'created_exists':'deleting', 'modified_missing': 'creating', 'move_no_destination': 'moving'}
+    type2change = {
+      'created_exists': 'deleting',
+      'modified_missing': 'creating',
+      'move_no_destination': 'moving'
+    }
     while True:
-      conflict = self.find_a_conflict()
-      if conflict is None:
+      if (conflict := self.find_a_conflict()) is None:
         break
       conflicts_found = True
       self.resolve_a_conflict(conflict)
       c = type2change[conflict['type']]
       desc  = 'Auto-resolved a conflict by ' + c + ' a path!\n'
       desc += 'Path: ' + conflict['new'][2] + '\n\n'
-      print(desc)
-      logging.critical(desc)
+      log_and_print(desc, level = logging.CRITICAL)
     if conflicts_found:
       print('All conflicts resolved.')
     else:
@@ -240,7 +265,7 @@ class Tools(object):
       print('Timestamp reset!\n')
       return
 
-  # XXX This assumes the directory depth will never get so large it causes call stack size issues
+  # NB This assumes the directory depth will never get so large it causes call stack size issues
   def walk_local_directory_and_ensure_it_matches_database(self, root, fix_discrepancies = False):
     if self.core.is_excluded(root):
       return
@@ -254,7 +279,9 @@ class Tools(object):
       self.ensure_local_item_matches_database(path, fix_discrepancies = fix_discrepancies)
 
   def ensure_local_item_matches_database(self, path, fix_discrepancies = False):
+    logging.debug(f'Checking: {path}')
     if self.core.is_excluded(path):
+      logging.debug(f'Skipping excluded path: {path}')
       return
 
     st = self.core.db.stat(path)
@@ -264,11 +291,11 @@ class Tools(object):
         # Directory
         try:
           if os.path.getmtime(full_path) != st['mtime']:
-            print('Wrong timestamp for directory:', path)
+            log_and_print(f'Discrepancy: Wrong timestamp for directory: {path}')
             if fix_discrepancies:
               os.utime(full_path, (st['mtime'], st['mtime']))
         except FileNotFoundError:
-          print('Missing directory:', path)
+          log_and_print(f'Discrepancy: Missing directory: {path}')
           if fix_discrepancies:
             os.mkdir(full_path)
             os.utime(full_path, (st['mtime'], st['mtime']))
@@ -279,32 +306,32 @@ class Tools(object):
         try:
           local_st = os.stat(full_path)
           if local_st.st_size != st['size']:
-            print('Wrong size for file:', path)
+            log_and_print(f'Discrepancy: Wrong size for file: {path}')
             if fix_discrepancies:
               self.core.move_to_history(path)
               self._get_file_from_remote_servers_by_hash_and_size(st['hash'], st['size'], full_path)
           if hash_file_cached(full_path) != st['hash']:
-            print('Wrong hash for file:', path)
+            log_and_print(f'Discrepancy: Wrong hash for file: {path}')
             if fix_discrepancies:
               self.core.move_to_history(path)
               self._get_file_from_remote_servers_by_hash_and_size(st['hash'], st['size'], full_path)
           if local_st.st_mtime != st['mtime']:
-            print('Wrong timestamp for file:', path)
+            log_and_print(f'Discrepancy: Wrong timestamp for file: {path}')
             if fix_discrepancies:
               os.utime(full_path, (st['mtime'], st['mtime']))
         except FileNotFoundError:
-          print('Missing file:', path)
+          log_and_print(f'Discrepancy: Missing file: {path}')
           if fix_discrepancies:
             self._get_file_from_remote_servers_by_hash_and_size(st['hash'], st['size'], full_path)
     else: # Shouldn't exist
       if os.path.isdir(full_path):
         self.walk_local_directory_and_ensure_it_matches_database(path, fix_discrepancies = fix_discrepancies)
         if not os.listdir(full_path):
-          print('Directory not in database:', path)
+          log_and_print(f'Discrepancy: Directory not in database: {path}')
           if fix_discrepancies:
             os.rmdir(full_path)
       elif os.path.isfile(full_path):
-        print('File not in database:', path)
+        log_and_print(f'Discrepancy: File not in database: {path}')
         if fix_discrepancies:
           self.core.move_to_history(path)
 
@@ -324,11 +351,11 @@ class Tools(object):
 
 def main():
   import argparse
-  parser = argparse.ArgumentParser(description='ReflectiveNAS Tools\nSee readme.md for help.')
+  parser = argparse.ArgumentParser(description='ReflectiveNAS Tools\nSee README.md for help.')
   parser.add_argument('-c', '--config', help='config file path', default='config.json')
   args = parser.parse_args()
   
-  core = ReflectiveNAS.Core(config_path=args.config)
+  core = ReflectiveNAS.Core(config_path = args.config, fail_locally = True)
   tools = Tools(core)
   try:
     tools.main_menu()

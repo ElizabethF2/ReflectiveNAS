@@ -9,9 +9,9 @@ old/
 *.db
 *.json
 *.bat
-spindown.py
 emergency_dns_updater.py
 quickstart.py
 path_helper.py
 debug_tools.py
 list_hd.py
+!config.example.json

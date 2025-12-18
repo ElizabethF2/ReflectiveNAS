@@ -1,9 +1,25 @@
-import sys, os, platform, errno, threading, time, json, sqlite3, requests, logging, enum, pickle, hashlib, queue, shutil, http.server, socketserver, ssl, email.message, smtplib, stat, posixpath, datetime, binascii
-sys.path.append('FUSE')
-import fuse
+import sys, os, platform, errno, threading, time, json, sqlite3, logging, enum
+import pickle, hashlib, queue, shutil, http.server, socketserver, ssl
+import stat, posixpath, datetime, binascii, socket
+
+import requests
+try:
+  import refuse.high as fuse
+except ModuleNotFoundError:
+  fuse = None
 
 # Each change uses 158 B to 32188 B depending on path length, size, etc.
 CHANGE_PAGE_SIZE = 1000
+
+DEFAULT_EPSILON = 0.00004
+
+li = type('LazyImporter', (), {'__getattr__': lambda _, i: __import__(i)})()
+
+# Workaround for https://github.com/pleiszenburg/refuse/pull/34
+try:
+  li.refuse._refactor.sys = sys
+except ModuleNotFoundError:
+  pass
 
 class AsyncTask(object):
   def __init__(self, func, args=(), kwargs={}):
@@ -73,7 +89,7 @@ class DatabaseConnection(object):
     self.core = core
     self.config = core.config
     self.con = sqlite3.connect(self.config['Database']['Path'])
-    cur = self.con.execute('PRAGMA CACHE_SIZE = ' + str(round(-1024*self.config['Database']['Cache_Size'])) + ';')
+    cur = self.con.execute('PRAGMA CACHE_SIZE = ' + str(round(-1024*int(self.config['Database']['Cache_Size']))) + ';')
     cur.execute('create table if not exists changes (timestamp REAL, action INTEGER, path BLOB, hash BLOB, size INTEGER, mtime INTEGER, UNIQUE (timestamp, action, path, hash, size, mtime))')
     cur.execute('create table if not exists vars (key BLOB PRIMARY KEY, value BLOB)')
     self.cache_stale = True
@@ -81,7 +97,14 @@ class DatabaseConnection(object):
   def close(self):
     self.con.close()
 
-  def record_change(self, action, path, timestamp=None, hash=None, size=None, mtime=None):
+  def record_change(self,
+                    action,
+                    path,
+                    timestamp = None,
+                    hash = None,
+                    size = None,
+                    mtime = None,
+                    use_epsilon = None):
     if None in (hash, size, mtime): full_path = self.core.full_path(path)
     if None in (size, mtime): st = os.stat(full_path)
 
@@ -95,8 +118,38 @@ class DatabaseConnection(object):
     if mtime is None: mtime = st.st_mtime
 
     self.cache_stale = True
+    if use_epsilon is None:
+      use_epsilon = self.config.get('Use_Epsilon_To_Separate_Changes', True)
     with self.con:
-      self.con.execute('INSERT INTO changes VALUES (?,?,?,?,?,?)', (timestamp, action, path, hash, size, mtime))
+      if use_epsilon:
+        epsilon = self.config.get('Epsilon', DEFAULT_EPSILON)
+        old_level = self.con.isolation_level
+        self.con.isolation_level = 'EXCLUSIVE'
+        try:
+          cur = self.con.execute('BEGIN EXCLUSIVE')
+          cur.execute('SELECT timestamp FROM changes WHERE path=(?) ORDER BY timestamp DESC LIMIT 1', (path,))
+          r = cur.fetchone()
+          last = r[0] if r else 0
+          delta = timestamp - last
+          if delta < epsilon:
+            timestamp = last + epsilon
+            while True:
+              remaining = timestamp - time.time()
+              if remaining <= 0:
+                break
+              time.sleep(remaining)
+          self.con.execute('INSERT INTO changes VALUES (?,?,?,?,?,?)',
+                         (timestamp, action, path, hash, size, mtime))
+          self.con.commit()
+        except Exception as exc:
+          self.con.rollback()
+          raise
+        finally:
+          self.con.isolation_level = old_level
+          cur.close()
+      else:
+        self.con.execute('INSERT INTO changes VALUES (?,?,?,?,?,?)',
+                         (timestamp, action, path, hash, size, mtime))
 
   def get_changes_since(self, timestamp, page=0):
     limit = CHANGE_PAGE_SIZE
@@ -272,25 +325,29 @@ class DatabaseConnection(object):
       if path_exists and action in CREATE_ACTIONS:
         if fail_safe_on_conflict:
           self.core.fail_safe(cpath + ' - CONFLICT: created but already exists')
-        conflict = {'type':'created_exists', 'new': change, 'last': last_change}
+        conflict = {
+          'type': 'created_exists',
+          'new': change,
+          'last': last_change
+        }
         return db_hash.digest(), last_local_timestamp, conflict
       if not path_exists and action not in CREATE_ACTIONS:
         if fail_safe_on_conflict:
           self.core.fail_safe(cpath + " - CONFLICT: modified but doesn't exist")
-        conflict = {'type':'modified_missing', 'new': change}
+        conflict = {'type': 'modified_missing', 'new': change}
         return db_hash.digest(), last_local_timestamp, conflict
       if len(change[3]) != 20 and len(change[3]) != 0:
         self.core.fail_safe(cpath + ' - invalid hash length')
       if hash != '?' and path_exists and len(change[3]) != len(hash):
         if fail_safe_on_conflict:
           self.core.fail_safe(cpath + ' - CONFLICT: hash changed length')
-        conflict = {'type':'created_exists', 'new': change, 'last': last_change}
+        conflict = {'type': 'created_exists', 'new': change, 'last': last_change}
         return db_hash.digest(), last_local_timestamp, conflict
       if (action == Action.MOVE_SOURCE or action == Action.MOVE_DESTINATION) and not self._find_move_pair(change):
         if fail_safe_on_conflict:
           self.core.fail_safe(cpath + ' - missing move pair')
         if action == Action.MOVE_SOURCE:
-          conflict = {'type':'move_no_destination', 'new': change, 'last': last_change}
+          conflict = {'type': 'move_no_destination', 'new': change, 'last': last_change}
           return db_hash.digest(), last_local_timestamp, conflict
         self.core.fail_safe(cpath + ' - missing move source')
       if action in CREATE_ACTIONS:
@@ -330,14 +387,30 @@ class MultithreadedDatabaseConnection(object):
     db = DatabaseConnection(self.core)
     while True:
       try:
-        fname, args, kwargs, result = self.q.get(timeout=1)
-        r, ex = None, None
-        try: r = getattr(db, fname)(*args, **kwargs)
-        except Exception as e: ex = e
-        result.put((r, ex))
+        fname, args, kwargs, result = self.q.get(timeout = 1)
+        fail_on_error = kwargs.pop('fail_on_error', False)
+        ret, exception = None, None
+        try:
+          ret = getattr(db, fname)(*args, **kwargs)
+        except Exception as e:
+          exception = e
+        if fail_on_error and exception is not None:
+          if self.core.fail_locally:
+            raise exception
+          else:
+            def fail_thread(exception):
+              logging.error('Uncaught database exception',
+                            exc_info = (type(exception),
+                                        exception,
+                                        exception.__traceback__))
+              self.fail_safe('Uncaught database exception')
+          thread = threading.Thread(target = fail_thread,
+                                    args = (exception,))
+          thread.start()
+        result.put((ret, exception))
       except queue.Empty:
         if not self.keep_running:
-          break      
+          break
     db.close()
 
   def __getattr__(self, name):
@@ -345,10 +418,12 @@ class MultithreadedDatabaseConnection(object):
 
   def _invoke_async(self, fname, args, kwargs):
     result = queue.Queue()
+    kwargs.setdefault('fail_on_error', True)
     self.q.put((fname, args, kwargs, result))
     return result
 
   def _invoke(self, fname, args, kwargs):
+    kwargs.setdefault('fail_on_error', False)
     result = self._invoke_async(fname, args, kwargs)
     r, ex = result.get()
     if ex:
@@ -374,27 +449,27 @@ class MultithreadedDatabaseConnection(object):
     return self._invoke_async('record_change', args, kwargs)
 
 class Core(object):
-  def __init__(self, config_path = 'config.json', fail_locally=False):
-    with open(config_path,'r') as f:
-      self.config = json.loads(f.read())
+  def __init__(self, config_path = 'config.json', fail_locally = False):
     self.fail_locally = fail_locally
     self.fail_safe_callbacks = []
     self.exit_callbacks = []
     self.exit_in_progress_lock = threading.Lock()
     self.exit_in_progress = False
-    self._fix_config_paths()
-    self._setup_logging()
-    self.real_directory = self.config['Passthrough']['Real_Directory']
     self.memfs = {}
-    self.db = MultithreadedDatabaseConnection(self)
     self.exit_event = threading.Event()
-    self.return_code = 0
-    self.code_hash = hash_file(__file__)
-    self._cache_certs()
+    self.return_code = None
     self.fds = {}
     self.fds_lock = threading.Lock()
     self.paths = {}
     self.paths_lock = threading.Lock()
+    with open(config_path,'r') as f:
+      self.config = json.loads(f.read())
+    self._fix_config_paths()
+    self._setup_logging()
+    self.real_directory = self.config['Passthrough']['Real_Directory']
+    self.db = MultithreadedDatabaseConnection(self)
+    self.code_hash = hash_file(__file__)
+    self._cache_certs()
 
   def _make_abs(self, path):
     if 'cygwin' in sys.platform.lower():
@@ -411,12 +486,13 @@ class Core(object):
                         format='%(asctime)s %(name)-12s %(levelname)-8s %(message)s',
                         datefmt='%Y-%m-%d %H:%M',
                         level=self.config['Logging']['Level'])
-    def log_exception_handler(type, value, tb):
-      logging.error('Uncaught exception', exc_info=(type, value, tb))
-      self.fail_safe('Uncaught exception')
-    sys.excepthook = log_exception_handler
+    if not self.fail_locally:
+      def log_exception_handler(type, value, tb):
+        logging.error('Uncaught exception', exc_info=(type, value, tb))
+        self.fail_safe('Uncaught exception')
+      sys.excepthook = log_exception_handler
 
-  # workaroung since WinFSP can change the working directory
+  # workaround since WinFSP can change the working directory
   def _fix_config_paths(self):
     c = self.config
     c['Passthrough']['Real_Directory'] = self._make_abs(c['Passthrough']['Real_Directory'])
@@ -430,7 +506,7 @@ class Core(object):
       if c['Passthrough']['Excluded_Paths'][i][-1] != posixpath.sep:
         c['Passthrough']['Excluded_Paths'][i] += posixpath.sep
 
-  # setup cache for loading SSL certs without having to spinup the disc
+  # setup cache for loading SSL certs without having to spinup the disk
   def _cache_certs(self):
     with open(self.config['Local_Server']['Cert_Path'], 'rb') as f:
       self.cached_cert = f.read()
@@ -524,10 +600,15 @@ class Core(object):
     subject = '[ReflectiveNAS] ' + subject
     msg = 'Source: ' + self.config['Friendly_Name'] + '\n\n' + msg
     logging.critical('Sending email...\nSubject: ' + subject + '\n' + msg)
+    user = self.config.get('Email', {}).get('User')
+    if not user:
+      logging.critical('Skipping sending email - no user set')
+      return
+    import email.message, smtplib
     try:
       m = email.message.EmailMessage()
       m['Subject'] = subject
-      m['From'] = self.config['Email']['User']
+      m['From'] = user
       recipient = ', '.join(self.config['Email']['Recipients'])
       m['to'] = recipient
       m.set_content(msg)
@@ -537,7 +618,7 @@ class Core(object):
         s = smtplib.SMTP(self.config['Email']['Host']+':'+str(self.config['Email']['Port']))
       if self.config['Email']['TLS']:
         s.starttls()
-      s.login(self.config['Email']['User'], self.config['Email']['Password'])
+      s.login(user, self.config['Email']['Password'])
       s.send_message(m)
       s.quit()
       logging.info('Message sent!')
@@ -548,8 +629,14 @@ class Core(object):
     try:
       self.exit_event.wait()
     except KeyboardInterrupt:
-      pass
-    sys.exit(self.return_code)
+      self.exit()
+      self.exit_event.wait()
+    return self.return_code
+
+  def __del__(self):
+    for callback in self.exit_callbacks:
+      callback(self.return_code)
+    self.db.close()
 
   def exit(self, return_code = 0):
     first_exit = False
@@ -558,12 +645,9 @@ class Core(object):
         self.exit_in_progress = True
         first_exit = True
     if first_exit:
-      for callback in self.exit_callbacks:
-        callback(return_code)
-      self.db.close()
       self.return_code = return_code
+      self.__del__()
       self.exit_event.set()
-      os._exit(return_code)
 
   def fail_safe(self, reason, propagate=True):
     print('FAIL_SAFE', reason)
@@ -581,7 +665,11 @@ class Core(object):
       print(t, msg)
 
 class PathLock(object):
-  def __init__(self, core, path, reentrant=True, only_unlock_on_exception=False):
+  def __init__(self,
+               core,
+               path,
+               reentrant = True,
+               only_unlock_on_exception = False):
     self.core = core
     self.path = path
     self.only_unlock_on_exception = only_unlock_on_exception
@@ -617,11 +705,16 @@ class MemFSFile(object):
     try: self.memfs.pop(self.memfs_path)
     except KeyError: pass
 
-class FusePassthrough(fuse.Operations):
+class FusePassthrough(fuse.Operations if fuse else object):
   def __init__(self, core):
     self.core = core
     self.system = platform.system()
     self.rwlock = threading.Lock()
+    if not fuse:
+      raise ModuleNotFoundError(
+        'Cannot use {} when {} is not installed'
+          .format(self.__class__.__name__, 'refuse')
+      )
 
     # Setup statvfs shim and ids if we're on Windows
     if self.system == 'Windows':
@@ -629,15 +722,25 @@ class FusePassthrough(fuse.Operations):
       from ctypes import WINFUNCTYPE, windll, POINTER, byref, c_ulonglong
       from ctypes.wintypes import BOOL, DWORD, LPCWSTR
       PULARGE_INTEGER = POINTER(c_ulonglong)
-      GetDiskFreeSpaceExW = WINFUNCTYPE(BOOL, LPCWSTR, PULARGE_INTEGER, PULARGE_INTEGER, PULARGE_INTEGER)(("GetDiskFreeSpaceExW", windll.kernel32))
-      GetLastError = WINFUNCTYPE(DWORD)(("GetLastError", windll.kernel32))
+      GetDiskFreeSpaceExW = WINFUNCTYPE(BOOL,
+                                        LPCWSTR,
+                                        PULARGE_INTEGER,
+                                        PULARGE_INTEGER,
+                                        PULARGE_INTEGER)(
+                                          ("GetDiskFreeSpaceExW",
+                                           windll.kernel32))
       def statvfs(path):
         n_free_for_user = c_ulonglong(0)
         n_total         = c_ulonglong(0)
         n_free          = c_ulonglong(0)
-        r = GetDiskFreeSpaceExW(path, byref(n_free_for_user), byref(n_total), byref(n_free))
+        r = GetDiskFreeSpaceExW(
+          path, byref(n_free_for_user), byref(n_total), byref(n_free)
+        )
         if r == 0:
-          raise OSError('[WinError %d] GetDiskFreeSpaceExW for %r' % (GetLastError(), path))
+          raise OSError(
+            '[WinError %d] GetDiskFreeSpaceExW for %r' % 
+              (ctypes.GetLastError(), path)
+          )
         return os.statvfs_result([
           4096,                        # f_bsize
           4096,                        # f_frsize
@@ -648,15 +751,40 @@ class FusePassthrough(fuse.Operations):
           1,                           # f_ffree
           1,                           # f_favail
           0,                           # f_flag
-          255])                        # f_namemax
+          255,                         # f_namemax
+        ])
       self._statvfs = statvfs
     else:
       self._statvfs = os.statvfs
 
+  def _get_libfuse_path(self):
+    if path := getattr(self, '_libfuse_path', None):
+      return path
+    try:
+      self._libfuse = fuse.get_libfuse(self.system)
+      self._libfuse_path = self._libfuse._name
+    except (AttributeError, ValueError, TypeError):
+      self._libfuse_path = fuse._libfuse_path
+    return self._libfuse_path
+
+  def _get_libfuse(self):
+    if lib := getattr(self, '_libfuse', None):
+      return lib
+    path = self._get_libfuse_path()
+    if lib := getattr(self, '_libfuse', None):
+      return lib
+    import ctypes
+    lib = ctypes.CDLL(path)
+    self._libfuse = lib
+    return lib
+
   def _get_uid_gid(self):
     import subprocess
-    d, f = os.path.split(fuse._libfuse_path)
-    cmd = os.path.join(d, 'fsptool-x86.exe' if 'x86' in f else 'fsptool-x64.exe') + ' id'
+    d, f = os.path.split(self._get_libfuse_path())
+    cmd = [
+      os.path.join(d, 'fsptool-x86.exe' if 'x86' in f else 'fsptool-x64.exe'),
+      'id'
+    ]
     ids = {}
     for line in subprocess.check_output(cmd).splitlines():
       sp = line.split(b'=')
@@ -664,18 +792,66 @@ class FusePassthrough(fuse.Operations):
     return ids[b'uid'], ids[b'gid']
 
   def start_async(self):
-    def _(self):
+    def _fuse_thread(self):
       fuse.FUSE(self, self.core.config['Passthrough']['Proxy_Directory'],
                 allow_other=self.core.config['Passthrough']['Allow_Other'],
                 foreground=True)
-      self.core.exit()
-    return AsyncTask(_, (self,))
+      if not getattr(self, '_stopped', False):
+        raise RuntimeError('FUSE unexpectedly stopped')
+    thread = threading.Thread(target = _fuse_thread, args = (self,))
+    exit_callback = lambda rc, s = self: s.stop()
+    self._exit_callback = exit_callback
+    self._thread = thread
+    self.core.exit_callbacks.append(exit_callback)
+    thread.start()
+    return self
+
+  def stop(self):
+    if not (thread := getattr(self, '_thread', None)) or not thread.is_alive():
+      raise RuntimeError('Cannot stop a passthrough which was never started')
+    while True:
+      event = None
+      with self.rwlock:
+        self._exit_in_progress = True
+        if (not (event := getattr(self, '_exit_event', None)) and
+            ((pending := getattr(self, '_pending_exit_ops', 0))) > 0):
+          event = threading.Event()
+          self._exit_event = event
+      if event:
+        event.wait()
+      if pending == 0:
+        break
+    proxdir = self.core.config['Passthrough']['Proxy_Directory']
+    with self.rwlock:
+      if not getattr(self, '_stopped', False):
+        self._stopped = True
+        if fusermount := shutil.which('fusermount'):
+          li.subprocess.check_call((fusermount, '-u', proxdir))
+        elif fusermount := shutil.which('fusermount3'):
+          li.subprocess.check_call((fusermount, '-u', proxdir))
+        elif umount := shutil.which('umount'):
+          li.subprocess.check_call((umount, proxdir))
+        else:
+          os.kill(os.getpid(), li.signal.SIGTERM)
+        self.core.exit_callbacks.remove(self._exit_callback)
+    try:
+      os.listdir(proxdir)
+    except OSError:
+      pass
+    thread.join()
+    for i in ('_exit_in_progress', '_stopped'):
+      self.__dict__.pop(i, None)
+
+  def wait_until_stopped(self):
+    if thread := getattr(self, '_thread', None):
+      thread.join()
 
   def _copy_on_write(self, path, fd):
     modified = False
     with self.core.fds_lock:
       try:
-        if not self.core.fds[fd]['created'] and not self.core.fds[fd]['modified']:
+        if (not self.core.fds[fd]['created'] and
+            not self.core.fds[fd]['modified']):
           self.core.fds[fd]['modified'] = True
           modified = True
       except KeyError:
@@ -697,12 +873,21 @@ class FusePassthrough(fuse.Operations):
       except OSError as err:
         raise fuse.FuseOSError(err.errno)
     return wrapper
-    
+
   def _block_if_exit_in_progress(func):
     def wrapper(self, *args, **kwargs):
-      if self.core.exit_in_progress:
-        raise fuse.FuseOSError(errno.EACCES)
-      return func(self, *args, **kwargs)
+      with self.rwlock:
+        if getattr(self, '_exit_in_progress', False):
+          raise fuse.FuseOSError(errno.EACCES)
+        self._pending_exit_ops = getattr(self, '_pending_exit_ops', 0) + 1
+      try:
+        return func(self, *args, **kwargs)
+      finally:
+        with self.rwlock:
+          self._pending_exit_ops = getattr(self, '_pending_exit_ops', 0) - 1
+          if (self._pending_exit_ops == 0 and 
+              (event := getattr(self, '_exit_event', None))):
+            event.set()
     return wrapper
 
   @_block_if_exit_in_progress
@@ -798,7 +983,9 @@ class FusePassthrough(fuse.Operations):
   def readdir(self, path, fh):
     memfs = [i[1:] for i in self.core.memfs] if path == '/' else []
     ls = os.listdir(self.core.full_path(path))
-    ls = filter(lambda i: not self.core.is_excluded(posixpath.join(path, i)), ls)
+    ls = filter(
+      lambda i: not self.core.is_excluded(posixpath.join(path, i)), ls
+    )
     return ['.', '..'] + list(ls) + memfs
 
   def readlink(self, path):
@@ -948,10 +1135,19 @@ class FusePassthrough(fuse.Operations):
         os.lseek(fd, offset, os.SEEK_SET)
         return os.write(fd, data)
 
+def escape_if_unprintable(i):
+  if (isprintable := getattr(i, 'isprintable', None)) and isprintable():
+    return i
+  if type(i) in (str, bytes):
+    return repr(i)
+  return i
+
 class SynchronizationRequestHandler(http.server.BaseHTTPRequestHandler):
-  def log_message(self, format, *args):
+  def log_message(self, fmt, *args):
     core = self.server.synchronizer.core
-    core.verbose_print(self.address_string() + ' - ' + format%args)
+    core.verbose_print(self.address_string() +
+                       ' - ' +
+                       (fmt % tuple(map(escape_if_unprintable, args))))
 
   def _authenticate(func):
     def wrapper(self, *args, **kwargs):
@@ -959,7 +1155,7 @@ class SynchronizationRequestHandler(http.server.BaseHTTPRequestHandler):
       secret = core.config['Local_Server']['Secret']
       xsecret = self.headers.get('X-Secret')
       if xsecret != secret:
-        request_info = repr(self.__dict__)+'\n-=Headers=-\n'+str(self.headers)
+        request_info = repr(self.__dict__)+'\n-=Headers=-\n'+escape_if_unprintable(str(self.headers))
         logging.error('unauthenticated request\n'+request_info)
         core.verbose_print('Blocked unauthenticated request from ' + self.address_string())
         return
@@ -1043,8 +1239,25 @@ class SynchronizationRequestHandler(http.server.BaseHTTPRequestHandler):
       self._send_json("OK")
       self.server.synchronizer.core.fail_safe(reason, propagate=False)
 
+def is_socket_connected(sock):
+  try:
+    sock.getpeername()
+    return True
+  except OSError:
+    return False
+
 class SynchronizationServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
   synchronizer = None
+  client_sockets = []
+
+  # Not thread-safe, assumed this is only ever called from one thread
+  def get_request(self):
+    conn, address = self.socket.accept()
+    self.client_sockets = list(filter(is_socket_connected, self.client_sockets))
+    self.client_sockets.append(conn)
+    if hasattr(conn, 'do_handshake'):
+      conn.do_handshake()
+    return conn, address
 
 class SynchronizationServerUnavailableException(Exception):
   pass
@@ -1058,7 +1271,7 @@ class IgnoreHostNameAdapter(requests.adapters.HTTPAdapter):
                                    assert_hostname=False)
 
 class SynchronizationClient(object):
-  def __init__(self, url, secret, core, use_memfs=True):
+  def __init__(self, url, secret, core, use_memfs = True):
     self.url = url
     if self.url.endswith('/'):
       self.url = self.url[:-1]
@@ -1082,9 +1295,10 @@ class SynchronizationClient(object):
         else:
           cert_path = self.core.config['Local_Server']['Cert_Path']
           return getattr(session, verb)(*args, verify = cert_path, **kwargs)
-      except requests.exceptions.RequestException:
+      except requests.exceptions.RequestException as exc:
+        logging.info(f'dbg _do_request: {exc}')
         time.sleep(self.retry_delay)
-    raise SynchronizationServerUnavailableException()
+    raise SynchronizationServerUnavailableException(self.url)
 
   def _get(self, *args, **kwargs):
     return self._do_request('get', args, kwargs)
@@ -1122,8 +1336,10 @@ class SynchronizationClient(object):
               if chunk:
                 f.write(chunk)
                 offset += len(chunk)
-            break
-          except requests.exceptions.RequestException:
+            if offset >= size:
+              break
+          except requests.exceptions.RequestException as exc:
+            logging.info(f'dbg get_file: {exc}')
             if itr == retry_count-1:
               self.core.fail_safe(url + ' - failed to download file too many times')
             time.sleep(self.retry_delay)
@@ -1135,40 +1351,68 @@ class SynchronizationClient(object):
     except SynchronizationServerUnavailableException: pass
 
 class Synchronizer(object):
-  def __init__(self, core, start_worker=True, use_memfs=True):
+  def __init__(self, core, use_memfs = True):
     self.core = core
     self.hd_age_email_sent = False
     self.ssl_socket = None
     self.db_hash = core.db.get_var('db_hash') or b''
     self.last_local_timestamp = core.db.get_var('last_local_timestamp') or 0
     self.last_remote_timestamp = core.db.get_var('last_remote_timestamp') or 0
-    self.remote_servers = []
+    self.remote_servers = [
+      SynchronizationClient(server['URL'],
+                            server['Secret'],
+                            core,
+                            use_memfs = use_memfs)
+      for server in self.core.config['Remote_Servers']
+    ]
     self.use_memfs = use_memfs
-    for server in self.core.config['Remote_Servers']:
-      client = SynchronizationClient(server['URL'], server['Secret'], core, use_memfs=use_memfs)
-      self.remote_servers.append(client)
-    if start_worker:
-      self.worker_thread = threading.Thread(target=self._worker, daemon=True)
-      self.worker_thread.start()
     core.fail_safe_callbacks.append(lambda *a, **k: self.fail_safe_callback(*a, **k))
-    core.exit_callbacks.append(lambda *a, **k: self.exit_callback(*a, **k))
     self.finished_applying_changes_event = threading.Event()
     self.finished_applying_changes_event.set()
+    self.stop_event = threading.Event()
     self.last_hash_mismatch_times = {}
 
   def _worker(self):
-    while True:
+    verify_delay = (
+      self.core.config['Synchronization']
+          .get('Delay_Before_Verifying_Database', 0)
+    )
+    sync_delay = self.core.config['Synchronization']['Delay_Between_Syncs']
+    sync_delay = max(0, sync_delay - verify_delay)
+    while not self.stop_event.is_set():
       self.update_DNS_records()
       if self.core.config['Local_Server']['Start_Server']:
         self.start_server()
       if self.core.config['Email']['Notify_When_HD_Should_Be_Replaced']:
         self.check_hd_age()
+      if verify_delay:
+        self.stop_event.wait(verify_delay)
       self.verify_database_and_files()
       self.core.verbose_print('Waiting')
-      time.sleep(self.core.config['Synchronization']['Delay_Between_Syncs'])
+      self.stop_event.wait(sync_delay)
       self.pull_changes_from_remote_servers()
       if self.core.config['Local_Server']['Start_Server']:
         self.kill_server()
+
+  def start_async(self):
+    if (thread := getattr(self, '_thread', None)) and thread.is_alive():
+      return RuntimeError('already started')
+    thread = threading.Thread(target = self._worker)
+    exit_callback = lambda rc, s = self: self.stop()
+    self._exit_callback = exit_callback
+    self._thread = thread
+    self.core.exit_callbacks.append(exit_callback)
+    thread.start()
+
+  def stop(self):
+    self.stop_event.set()
+    self.finished_applying_changes_event.wait()
+    self._thread.join()
+    self.core.exit_callbacks.remove(self._exit_callback)
+
+  def wait_until_stopped(self):
+    if thread := getattr(self, '_thread', None):
+      thread.join()
 
   def update_DNS_records(self):
     self.core.verbose_print('Updating DNS record')
@@ -1228,18 +1472,20 @@ class Synchronizer(object):
     self.server = SynchronizationServer(('', self.core.config['Local_Server']['Port']), SynchronizationRequestHandler)
     self.server.synchronizer = self
     self.server.daemon_threads = True
+    ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
     if self.use_memfs:
       with MemFSFile('.cert', self.core.cached_cert, self.core) as cert:
         with MemFSFile('.key', self.core.cached_key, self.core) as key:
-          self.server.socket = ssl.wrap_socket(self.server.socket,
-                                               certfile=cert.file_path,
-                                               keyfile=key.file_path,
-                                               server_side=True)
+          ctx.load_cert_chain(certfile = cert.file_path, keyfile = key.file_path)
+          self.server.socket = ctx.wrap_socket(self.server.socket,
+                                               server_side=True,
+                                               do_handshake_on_connect=False)
     else:
-      self.server.socket = ssl.wrap_socket(self.server.socket,
-                                           certfile=self.core.config['Local_Server']['Cert_Path'],
-                                           keyfile=self.core.config['Local_Server']['Key_Path'],
-                                           server_side=True)
+      ctx.load_cert_chain(certfile = self.core.config['Local_Server']['Cert_Path'],
+                          keyfile = self.core.config['Local_Server']['Key_Path'])
+      self.server.socket = ctx.wrap_socket(self.server.socket,
+                                           server_side=True,
+                                           do_handshake_on_connect=False)
     def _(self):
       self.server.serve_forever()
       self.server.server_close()
@@ -1280,11 +1526,11 @@ class Synchronizer(object):
         if action == Action.CREATE:
           self.core.verbose_print('Applying change from ' + server.url + ' - Creating ' + path)
           try:
-            if len(hash):
+            if len(hash) > 0:
               try:
                 server.get_file(hash, size, fpath)
               except FileNotFoundError:
-                if (hash,size) in final_states:
+                if (hash, size) in final_states:
                   self.core.fail_safe(server.url + ' - ' + path + ' - missing create data')
                 else:
                   skipped_paths.add(path)
@@ -1385,22 +1631,26 @@ class Synchronizer(object):
       for server in self.remote_servers:
         t = threading.Thread(target=lambda r: server.fail_safe(r), args=(reason,), daemon=True)
         t.start()
-  
-  def exit_callback(self, return_code):
-    if not self.finished_applying_changes_event.is_set():
-      self.finished_applying_changes_event.wait()
 
 def main():
   import argparse
-  parser = argparse.ArgumentParser(description='ReflectiveNAS Server\nSee readme.md for help.')
-  parser.add_argument('-c', '--config', help='config file path', default='config.json')
+  parser = argparse.ArgumentParser(
+    description = 'ReflectiveNAS Server\nSee README.md for help.'
+  )
+  parser.add_argument(
+    '-c', '--config',
+    help = 'config file path',
+    default = 'config.json'
+  )
   args = parser.parse_args()
 
-  core = Core(config_path=args.config)
-  synchronizer = Synchronizer(core)
+  core = Core(config_path = args.config)
   passthrough = FusePassthrough(core)
   passthrough.start_async()
-  core.wait_for_exit()
+  synchronizer = Synchronizer(core)
+  synchronizer.start_async()
+  return_code = core.wait_for_exit()
+  sys.exit(return_code)
 
 if __name__ == '__main__':
   main()

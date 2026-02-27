@@ -634,7 +634,7 @@ class Core(object):
     return self.return_code
 
   def __del__(self):
-    for callback in self.exit_callbacks:
+    for callback in list(self.exit_callbacks):
       callback(self.return_code)
     self.db.close()
 
@@ -1296,7 +1296,6 @@ class SynchronizationClient(object):
           cert_path = self.core.config['Local_Server']['Cert_Path']
           return getattr(session, verb)(*args, verify = cert_path, **kwargs)
       except requests.exceptions.RequestException as exc:
-        logging.info(f'dbg _do_request: {exc}')
         time.sleep(self.retry_delay)
     raise SynchronizationServerUnavailableException(self.url)
 
@@ -1339,7 +1338,6 @@ class SynchronizationClient(object):
             if offset >= size:
               break
           except requests.exceptions.RequestException as exc:
-            logging.info(f'dbg get_file: {exc}')
             if itr == retry_count-1:
               self.core.fail_safe(url + ' - failed to download file too many times')
             time.sleep(self.retry_delay)
@@ -1386,9 +1384,10 @@ class Synchronizer(object):
       if self.core.config['Email']['Notify_When_HD_Should_Be_Replaced']:
         self.check_hd_age()
       if verify_delay:
+        self.core.verbose_print('Waiting to verify')
         self.stop_event.wait(verify_delay)
       self.verify_database_and_files()
-      self.core.verbose_print('Waiting')
+      self.core.verbose_print('Waiting to synchronize')
       self.stop_event.wait(sync_delay)
       self.pull_changes_from_remote_servers()
       if self.core.config['Local_Server']['Start_Server']:
@@ -1398,7 +1397,7 @@ class Synchronizer(object):
     if (thread := getattr(self, '_thread', None)) and thread.is_alive():
       return RuntimeError('already started')
     thread = threading.Thread(target = self._worker)
-    exit_callback = lambda rc, s = self: self.stop()
+    exit_callback = lambda rc, s = self: s.stop()
     self._exit_callback = exit_callback
     self._thread = thread
     self.core.exit_callbacks.append(exit_callback)
@@ -1494,6 +1493,11 @@ class Synchronizer(object):
 
   def kill_server(self):
     self.core.verbose_print('Stopping server')
+    self.server.__shutdown_request = True
+    try:
+      self.server.socket.shutdown(socket.SHUT_RDWR)
+    except (AttributeError, OSError):
+      pass
     self.server.shutdown()
 
   def apply_changes(self, changes, server):
@@ -1617,6 +1621,8 @@ class Synchronizer(object):
         if self.core.config['Email']['Notify_When_Other_Servers_Are_Offline']:
           self.core.send_email('Warning: A server could not be reached for synchronization',
                                server.url + ' could not be reached.')
+      except OSError:
+        skipped_a_server = True
       self.core.verbose_print('Finished pulling changes from ' + server.url)
       self.finished_applying_changes_event.set()
       if no_unexpected_hash_mismatch and server in self.last_hash_mismatch_times:

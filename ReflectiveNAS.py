@@ -21,6 +21,10 @@ try:
 except ModuleNotFoundError:
   pass
 
+# Workaround for select hanging
+if sys.platform.lower() == 'linux':
+  socketserver._ServerSelector = __import__('selectors').DefaultSelector
+
 class AsyncTask(object):
   def __init__(self, func, args=(), kwargs={}):
     self.completed = threading.Event()

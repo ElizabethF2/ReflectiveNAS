@@ -21,10 +21,6 @@ try:
 except ModuleNotFoundError:
   pass
 
-# Workaround for select hanging
-if sys.platform.lower() == 'linux':
-  socketserver._ServerSelector = __import__('selectors').DefaultSelector
-
 class AsyncTask(object):
   def __init__(self, func, args=(), kwargs={}):
     self.completed = threading.Event()
@@ -1495,14 +1491,35 @@ class Synchronizer(object):
     self.server_thread = threading.Thread(target=_, args=(self,), daemon=True)
     self.server_thread.start()
 
+  def _watchdog_thread(self, evt, timeout):
+    while True:
+      if evt.wait(timeout):
+        return
+      if self.core.fds:
+        continue
+      os.execlp(sys.executable, sys.executable, *sys.argv)
+
+  def start_watchdog(self):
+    evt = threading.Event()
+    timeout = self.core.config.get('Watchdog_Timeout')
+    if hasattr(os, 'execlp') and timeout:
+      t = threading.Thread(
+        target = self._watchdog_thread,
+        args = (evt, timeout),
+      )
+      t.start()
+    return evt
+
   def kill_server(self):
     self.core.verbose_print('Stopping server')
+    wd_event = self.start_watchdog()
     self.server.__shutdown_request = True
     try:
       self.server.socket.shutdown(socket.SHUT_RDWR)
     except (AttributeError, OSError):
       pass
     self.server.shutdown()
+    wd_event.set()
 
   def apply_changes(self, changes, server):
     self.finished_applying_changes_event.clear()

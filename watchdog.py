@@ -14,18 +14,27 @@ with open(args.config, 'r') as f:
 
 while True:
   # Try to unmount the proxy directory, ignore errors if it's already unmounted
-  if shutil.which('fusermount'):
+  if not (fusermount := shutil.which('fusermount')):
+    fusermount = shutil.which('fusermount3')
+  if fusermount:
     res = subprocess.run(['fusermount', '-u', config['Passthrough']['Proxy_Directory']])
     if res.returncode not in (SUCCESS, NO_MOUNT_ENTRY):
-      print('Invalid return code on unmount:', res.returncode)
+      print('Invalid return code on unmount:', res)
       sys.exit(-1)
   elif 'cygwin' not in sys.platform.lower():
     print('No valid unmount util for this platform. Update script or use a different OS.')
     sys.exit(-1)
 
   # Start ReflectiveNAS
-  nas_proc = subprocess.Popen([sys.executable, args.script, '-c', args.config],
-                              creationflags = CREATE_NEW_PROCESS_GROUP if sys.platform == 'win32' else 0)
+  kwargs = {}
+  if sys.platform == 'win32':
+    kwargs['creationflags'] = CREATE_NEW_PROCESS_GROUP
+  else:
+    kwargs['start_new_session'] = True
+  nas_proc = subprocess.Popen(
+    [sys.executable, args.script, '-c', args.config],
+    **kwargs,
+  )
 
   # Poll ReflectiveNAS until its REST endpoint becomes unresponsive
   try:
@@ -42,18 +51,18 @@ while True:
       except (ConnectionRefusedError, TimeoutError):
         alive = False
       sock.close()
-
       if not alive:
         break
-
+  except KeyboardInterrupt:
+    break
   finally:
     # Stop ReflectiveNAS
     if nas_proc.poll() is None:
-      nas_proc.send_signal(signal.CTRL_C_EVENT if sys.platform == 'win32' else signal.SIGINT)
+      nas_proc.send_signal(getattr(signal, 'CTRL_C_EVENT', signal.SIGINT))
       while nas_proc.poll() is None:
         try:
-          nas_proc.wait(timeout=config['Synchronization']['Timeout'])
+          nas_proc.wait(timeout = config['Synchronization']['Timeout'])
         except subprocess.TimeoutExpired:
-          nas_proc.send_signal(signal.CTRL_C_EVENT if sys.platform == 'win32' else signal.SIGINT)
+          nas_proc.terminate()
     else:
       sys.exit(nas_proc.poll())
